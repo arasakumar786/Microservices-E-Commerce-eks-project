@@ -1,72 +1,193 @@
+def TF_DIR = 'ecr-terraform'
 
 pipeline {
-    agent any
+agent any
 
-    parameters {
-        choice(
-            name: 'ACTION',
-            choices: ['apply', 'destroy'],
-            description: '🔧 Select the Terraform action to perform (apply = create/update, destroy = delete all)'
-        )
+```
+parameters {
+    choice(
+        name: 'ACTION',
+        choices: ['apply', 'destroy'],
+        description: 'Select Terraform action'
+    )
+}
+
+stages {
+
+    stage('Checkout from Git') {
+        steps {
+            checkout scm
+        }
     }
 
-    stages {
-        stage('Checkout from Git') {
-            steps {
-                echo 'Checking out Git repository...'
-            }
+    stage('Terraform Version') {
+        steps {
+            sh 'terraform --version'
         }
+    }
 
-        stage('Terraform version') {
-            steps {
-                sh 'terraform --version'
-            }
-        }
-
-        stage('Terraform init') {
-            steps {
-                dir('ecr-terraform') {
-                    sh 'terraform init --reconfigure'
-                }
-            }
-        }
-
-        stage('Terraform validate') {
-            steps {
-                dir('ecr-terraform') {
-                    sh 'terraform validate'
-                }
-            }
-        }
-
-        stage('Terraform plan') {
-            steps {
-                dir('ecr-terraform') {
-                    sh 'terraform plan'
-                }
-            }
-        }
-
-        stage('Terraform apply') {
-            when {
-                expression { params.ACTION == 'apply' }
-            }
-            steps {
-                dir('ecr-terraform') {
-                    sh 'terraform apply -auto-approve'
-                }
-            }
-        }
-
-        stage('Terraform destroy') {
-            when {
-                expression { params.ACTION == 'destroy' }
-            }
-            steps {
-                dir('ecr-terraform') {
-                    sh 'terraform destroy -auto-approve'
-                }
+    stage('Terraform Init') {
+        steps {
+            dir(TF_DIR) {
+                sh 'terraform init --reconfigure'
             }
         }
     }
+
+    stage('Terraform Validate') {
+        steps {
+            dir(TF_DIR) {
+                sh 'terraform validate'
+                sh 'terraform fmt -check'
+            }
+        }
+    }
+
+    stage('Security Scan') {
+        steps {
+            dir(TF_DIR) {
+                sh 'tfsec . || true'
+            }
+        }
+    }
+
+    stage('Plan') {
+        steps {
+            dir(TF_DIR) {
+                sh 'terraform plan -var-file=terraform.tfvars -out=tfplan'
+                sh 'terraform show -no-color tfplan > tfplan.txt'
+
+                script {
+                    env.PLAN_SUMMARY = sh(
+                        script: '''
+                            grep -E "^(Plan:|No changes\\.)" tfplan.txt || echo "Plan summary not found"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Terraform Plan Summary: ${env.PLAN_SUMMARY}"
+                }
+            }
+        }
+    }
+
+    stage('Publish Plan') {
+        steps {
+            archiveArtifacts artifacts: "${TF_DIR}/tfplan.txt", fingerprint: true
+        }
+    }
+
+    stage('Approval') {
+        when {
+            expression {
+                params.ACTION == 'apply'
+            }
+        }
+        steps {
+            script {
+                def plan = readFile("${TF_DIR}/tfplan.txt")
+
+                input(
+                    message: 'Review Terraform plan and approve deployment',
+                    ok: 'Deploy',
+                    parameters: [
+                        text(
+                            name: 'PlanOutput',
+                            defaultValue: plan,
+                            description: 'Terraform Plan Output'
+                        )
+                    ]
+                )
+            }
+        }
+    }
+
+    stage('Apply') {
+        when {
+            expression {
+                params.ACTION == 'apply'
+            }
+        }
+        steps {
+            dir(TF_DIR) {
+                sh 'terraform apply -input=false tfplan'
+            }
+        }
+    }
+
+    stage('Destroy') {
+        when {
+            expression {
+                params.ACTION == 'destroy'
+            }
+        }
+        steps {
+            dir(TF_DIR) {
+                input message: 'Confirm DESTROY', ok: 'Destroy'
+                sh 'terraform destroy -var-file=terraform.tfvars -auto-approve'
+            }
+        }
+    }
+}
+
+post {
+    success {
+        script {
+            slackSend(
+                channel: '#all-arasan',
+                color: 'good',
+                message: """
+```
+
+✅ Terraform ${params.ACTION} succeeded
+
+Build: #${env.BUILD_NUMBER}
+${env.PLAN_SUMMARY}
+
+${env.BUILD_URL}
+"""
+)
+
+```
+            if (fileExists("${TF_DIR}/tfplan.txt")) {
+                slackUploadFile(
+                    channel: '#all-arasan',
+                    filePath: "${TF_DIR}/tfplan.txt",
+                    initialComment: "Terraform Plan Output - Build #${env.BUILD_NUMBER}"
+                )
+            }
+        }
+    }
+
+    failure {
+        slackSend(
+            channel: '#all-arasan',
+            color: 'danger',
+            message: """
+```
+
+❌ Terraform ${params.ACTION} FAILED
+
+Build: #${env.BUILD_NUMBER}
+
+${env.BUILD_URL}console
+"""
+)
+}
+
+```
+    aborted {
+        slackSend(
+            channel: '#all-arasan',
+            color: 'warning',
+            message: """
+```
+
+⚠️ Terraform ${params.ACTION} ABORTED
+
+Build: #${env.BUILD_NUMBER}
+"""
+)
+}
+}
 }
