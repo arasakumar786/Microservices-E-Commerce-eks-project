@@ -13,7 +13,7 @@ pkg/
 .kubernetes-manifests-*/
 .project
 .eclipse.buildship.core.prefs
-.terraform
+.terraform*
 .terraform/*
 .terraform.lock.hcl
 *.tfvars
